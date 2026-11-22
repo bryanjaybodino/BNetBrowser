@@ -169,10 +169,10 @@ namespace BNetBrowser
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "BNetBrowser", "WebView2");
 
-        // Chrome fallback profile (used only in kiosk fallback, keeps it separate from the user's own Chrome)
-        private static readonly string ChromeKioskProfile = Path.Combine(
+        // Folder for the fallback browsers' kiosk profiles (kept apart from the user's own profiles)
+        private static readonly string FallbackProfileRoot = Path.Combine(
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
-            "BNetBrowser", "ChromeKiosk");
+            "BNetBrowser");
 
         // optional bundled WebView2 runtime next to the exe
         private static string FixedRuntimeFolder
@@ -184,8 +184,8 @@ namespace BNetBrowser
             }
         }
 
-        // true once we handed over to Google Chrome (no WebView2 / Edge runtime)
-        private bool chromeFallbackActive = false;
+        // true once we handed over to another browser (no WebView2 / Edge runtime)
+        private bool browserFallbackActive = false;
 
         public BrowserForm() : this("http://localhost/", false)
         {
@@ -209,7 +209,7 @@ namespace BNetBrowser
             trimTimer.Start();
 
             // No WebView2 (Edge) runtime -> try Google Chrome instead
-            if (!IsWebView2Available() && UseChromeFallback())
+            if (!IsWebView2Available() && UseBrowserFallback())
                 return;
 
             if (kioskMode)
@@ -245,20 +245,53 @@ namespace BNetBrowser
             }
             catch (Exception ex)
             {
-                // WebView2 failed -> Chrome is the alternative
-                if (UseChromeFallback()) return false;
+                // WebView2 failed -> another installed browser is the alternative
+                if (UseBrowserFallback()) return false;
 
                 MessageBox.Show(
-                    "Could not start the WebView2 (Edge) runtime, and Google Chrome was not found.\n\n" +
-                    "Install one of these:\n" +
-                    "- Evergreen WebView2 Runtime: https://go.microsoft.com/fwlink/p/?LinkId=2124703\n" +
-                    "- Google Chrome: https://www.google.com/chrome/\n\n" + ex.Message,
+                    "Could not start the WebView2 (Edge) runtime, and no supported browser " +
+                    "(Chrome, Brave, Edge, Firefox, Vivaldi) was found.\n\n" +
+                    "Install the 'Evergreen WebView2 Runtime' from Microsoft:\n" +
+                    "https://go.microsoft.com/fwlink/p/?LinkId=2124703\n\n" + ex.Message,
                     AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }
         }
 
-        // ================= Chrome fallback =================
+        // ================= Browser fallback =================
+        // Used when the WebView2 (Edge) runtime is missing. Supports Chrome, Brave,
+        // Edge, Firefox and Vivaldi. Optional: put a browser name (chrome / brave /
+        // edge / firefox / vivaldi) on the first line of browser.txt next to the exe
+        // to choose which one is tried first.
+
+        private sealed class ExternalBrowser
+        {
+            public string Name;
+            public string Exe;
+            public bool IsFirefox;
+        }
+
+        private sealed class Candidate
+        {
+            public string Name;
+            public string ExeName;      // for the registry "App Paths" lookup
+            public string RelPath;      // under Program Files / Program Files (x86) / LocalAppData
+            public bool IsFirefox;
+            public Candidate(string name, string exeName, string relPath, bool firefox)
+            {
+                Name = name; ExeName = exeName; RelPath = relPath; IsFirefox = firefox;
+            }
+        }
+
+        // default order = order of preference
+        private static readonly Candidate[] Candidates =
+        {
+            new Candidate("Chrome",  "chrome.exe",  @"Google\Chrome\Application\chrome.exe", false),
+            new Candidate("Brave",   "brave.exe",   @"BraveSoftware\Brave-Browser\Application\brave.exe", false),
+            new Candidate("Edge",    "msedge.exe",  @"Microsoft\Edge\Application\msedge.exe", false),
+            new Candidate("Firefox", "firefox.exe", @"Mozilla Firefox\firefox.exe", true),
+            new Candidate("Vivaldi", "vivaldi.exe", @"Vivaldi\Application\vivaldi.exe", false)
+        };
 
         private static bool IsWebView2Available()
         {
@@ -273,15 +306,15 @@ namespace BNetBrowser
             }
         }
 
-        // Finds chrome.exe: registry (App Paths) first, then the usual install folders.
-        private static string FindChrome()
+        private static ExternalBrowser Locate(Candidate c)
         {
+            // 1) registry App Paths
             try
             {
                 string[] keys =
                 {
-                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
-                    @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\" + c.ExeName,
+                    @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\" + c.ExeName
                 };
                 RegistryKey[] roots = { Registry.LocalMachine, Registry.CurrentUser };
 
@@ -290,11 +323,17 @@ namespace BNetBrowser
                         using (RegistryKey key = root.OpenSubKey(k))
                         {
                             string p = key == null ? null : key.GetValue(null) as string;
-                            if (!string.IsNullOrEmpty(p) && File.Exists(p)) return p;
+                            if (!string.IsNullOrEmpty(p))
+                            {
+                                p = p.Trim('"');
+                                if (File.Exists(p))
+                                    return new ExternalBrowser { Name = c.Name, Exe = p, IsFirefox = c.IsFirefox };
+                            }
                         }
             }
             catch { }
 
+            // 2) usual install folders
             string[] bases =
             {
                 Environment.GetEnvironmentVariable("ProgramFiles"),
@@ -305,52 +344,116 @@ namespace BNetBrowser
             foreach (string b in bases)
             {
                 if (string.IsNullOrEmpty(b)) continue;
-                string p = Path.Combine(b, "Google", "Chrome", "Application", "chrome.exe");
-                if (File.Exists(p)) return p;
+                string p = Path.Combine(b, c.RelPath);
+                if (File.Exists(p))
+                    return new ExternalBrowser { Name = c.Name, Exe = p, IsFirefox = c.IsFirefox };
             }
             return null;
         }
 
-        // Hands over to Google Chrome. Returns false if Chrome isn't installed / can't start.
-        private bool UseChromeFallback()
+        private static ExternalBrowser FindBrowser()
         {
-            if (chromeFallbackActive) return true;
+            string preferred = null;
+            try
+            {
+                string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "browser.txt");
+                if (File.Exists(cfg))
+                {
+                    string[] lines = File.ReadAllLines(cfg);
+                    if (lines.Length > 0) preferred = lines[0].Trim();
+                }
+            }
+            catch { }
 
-            string exe = FindChrome();
-            if (exe == null) return false;
+            if (!string.IsNullOrEmpty(preferred))
+            {
+                foreach (Candidate c in Candidates)
+                {
+                    if (!c.Name.Equals(preferred, StringComparison.OrdinalIgnoreCase)) continue;
+                    ExternalBrowser pb = Locate(c);
+                    if (pb != null) return pb;
+                }
+            }
 
-            chromeFallbackActive = true;
+            foreach (Candidate c in Candidates)
+            {
+                ExternalBrowser b = Locate(c);
+                if (b != null) return b;
+            }
+            return null;
+        }
+
+        // Hands over to another installed browser. Returns false if none found / can't start.
+        private bool UseBrowserFallback()
+        {
+            if (browserFallbackActive) return true;
+
+            ExternalBrowser browser = FindBrowser();
+            if (browser == null) return false;
+
+            browserFallbackActive = true;
 
             if (kioskMode)
             {
-                StartChromeKiosk(exe);
+                StartExternalKiosk(browser);
                 return true;
             }
 
             try
             {
                 string url = NormalizeUrl(homeUrl).Replace("\"", "%22");
-                Process.Start(new ProcessStartInfo(exe, "--new-window \"" + url + "\"")
-                {
-                    UseShellExecute = false
-                });
+                string args = browser.IsFirefox
+                    ? "-new-window \"" + url + "\""
+                    : "--new-window \"" + url + "\"";
+
+                Process.Start(new ProcessStartInfo(browser.Exe, args) { UseShellExecute = false });
             }
             catch
             {
-                chromeFallbackActive = false;
+                browserFallbackActive = false;
                 return false;
             }
 
-            // Chrome is open - this window has nothing left to do
+            // the browser is open - this window has nothing left to do
             Opacity = 0;
             ShowInTaskbar = false;
             BeginInvoke((Action)Close);
             return true;
         }
 
-        // Kiosk via Chrome: show the waiting screen until the server answers,
-        // start Chrome in --kiosk, and exit when Chrome is closed.
-        private async void StartChromeKiosk(string chromeExe)
+        private static string BuildKioskArgs(ExternalBrowser browser, string url)
+        {
+            string profile = Path.Combine(FallbackProfileRoot, "Kiosk_" + browser.Name);
+            Directory.CreateDirectory(profile);
+
+            if (browser.IsFirefox)
+            {
+                // keep the first-run / welcome pages out of the kiosk
+                try
+                {
+                    File.WriteAllText(Path.Combine(profile, "user.js"),
+                        "user_pref(\"browser.aboutwelcome.enabled\", false);\r\n" +
+                        "user_pref(\"startup.homepage_welcome_url\", \"\");\r\n" +
+                        "user_pref(\"startup.homepage_welcome_url.additional\", \"\");\r\n" +
+                        "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\r\n" +
+                        "user_pref(\"browser.shell.checkDefaultBrowser\", false);\r\n" +
+                        "user_pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\r\n" +
+                        "user_pref(\"browser.sessionstore.resume_from_crash\", false);\r\n");
+                }
+                catch { }
+
+                return "-no-remote -profile \"" + profile + "\" -kiosk \"" + url + "\"";
+            }
+
+            return "--kiosk --no-first-run --no-default-browser-check " +
+                   "--disable-pinch --overscroll-history-navigation=0 " +
+                   "--disable-infobars --noerrdialogs --disable-session-crashed-bubble " +
+                   "--user-data-dir=\"" + profile + "\" \"" + url + "\"";
+        }
+
+        // Kiosk via an external browser: show the waiting screen until the server answers,
+        // start the browser in kiosk mode, and exit when it is closed.
+        private async void StartExternalKiosk(ExternalBrowser browser)
         {
             try
             {
@@ -395,22 +498,19 @@ namespace BNetBrowser
                 await Task.Delay(5000);   // settle time after the server first answers
                 if (IsDisposed) return;
 
-                Directory.CreateDirectory(ChromeKioskProfile);
-                string args = "--kiosk --no-first-run --no-default-browser-check " +
-                              "--disable-pinch --overscroll-history-navigation=0 " +
-                              "--disable-infobars --noerrdialogs --disable-session-crashed-bubble " +
-                              "--user-data-dir=\"" + ChromeKioskProfile + "\" \"" + url + "\"";
+                Process p = Process.Start(new ProcessStartInfo(browser.Exe, BuildKioskArgs(browser, url))
+                {
+                    UseShellExecute = false
+                });
 
-                Process p = Process.Start(new ProcessStartInfo(chromeExe, args) { UseShellExecute = false });
-
-                Hide();   // let Chrome own the screen
+                Hide();   // let the browser own the screen
                 if (p != null) await Task.Run(() => p.WaitForExit());
                 if (!IsDisposed) Close();
             }
             catch (Exception ex)
             {
                 if (IsDisposed) return;
-                MessageBox.Show("Could not start Google Chrome.\n\n" + ex.Message,
+                MessageBox.Show("Could not start " + browser.Name + ".\n\n" + ex.Message,
                     AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 Close();
             }
