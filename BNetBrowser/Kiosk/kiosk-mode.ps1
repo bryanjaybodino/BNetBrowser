@@ -142,6 +142,9 @@ while ($true) {
     # 1. Close any browser that is not the kiosk
     if ($kiosk.Count -gt 0) {
         foreach ($p in $other) {
+            # child processes of the kiosk browser (e.g. Firefox content processes do not
+            # carry the profile path in their command line) must be left alone
+            if ($kioskTree.Contains([uint32]$p.ProcessId)) { continue }
             Stop-Process -Id $p.ProcessId -Force -ErrorAction SilentlyContinue
         }
     }

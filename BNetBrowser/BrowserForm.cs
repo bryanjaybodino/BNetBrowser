@@ -1,4 +1,5 @@
 ﻿using System;
+using System.Collections.Generic;
 using System.Diagnostics;
 using System.Drawing;
 using System.IO;
@@ -208,10 +209,6 @@ namespace BNetBrowser
         {
             trimTimer.Start();
 
-            // No WebView2 (Edge) runtime -> try Google Chrome instead
-            if (!IsWebView2Available() && UseBrowserFallback())
-                return;
-
             if (kioskMode)
             {
                 StartKiosk();
@@ -237,7 +234,7 @@ namespace BNetBrowser
                 {
                     UserDataFolder = DataFolder,
                     BrowserExecutableFolder = FixedRuntimeFolder,
-                    AdditionalBrowserArguments = "--overscroll-history-navigation=0 --disable-pinch"
+                    AdditionalBrowserArguments = "--overscroll-history-navigation=0 --disable-pinch " + LightArgsCommon + ExtraArgs()
                 };
 
                 await wb.EnsureCoreWebView2Async(null);
@@ -245,7 +242,8 @@ namespace BNetBrowser
             }
             catch (Exception ex)
             {
-                // WebView2 failed -> another installed browser is the alternative
+                // WebView2 failed to start -> another installed browser is the alternative
+                LogFallback(ex);
                 if (UseBrowserFallback()) return false;
 
                 MessageBox.Show(
@@ -256,6 +254,73 @@ namespace BNetBrowser
                     AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
             }
+        }
+
+        // ================= Low resource mode =================
+        // The pages only use Serial Port, WebSocket and SSE, so everything else
+        // (sync, updates, telemetry, translate, autofill, phishing checks, extra
+        // renderer processes ...) is switched off. Nothing here touches networking
+        // sockets, SSE or Web Serial.
+        //
+        // Optional: put extra command-line flags on the first line of extra-args.txt
+        // next to the exe (for example --disable-gpu or --js-flags=--max-old-space-size=256).
+
+        private const string LightArgsCommon =
+            "--renderer-process-limit=1 --in-process-gpu --enable-low-end-device-mode " +
+            "--disable-background-networking --disable-sync --disable-default-apps " +
+            "--disable-component-update --disable-breakpad --disable-domain-reliability " +
+            "--disable-client-side-phishing-detection --metrics-recording-only --no-pings " +
+            "--disable-features=Translate,MediaRouter,OptimizationHints,AutofillServerCommunication," +
+            "InterestFeedContentSuggestions,msSmartScreenProtection," +
+            "IsolateOrigins,site-per-process,NetworkServiceInProcess,NetworkServiceInProcess2";
+
+        private static string ExtraArgs()
+        {
+            try
+            {
+                string f = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "extra-args.txt");
+                if (File.Exists(f))
+                {
+                    string[] lines = File.ReadAllLines(f);
+                    if (lines.Length > 0 && !string.IsNullOrWhiteSpace(lines[0]))
+                        return " " + lines[0].Trim();
+                }
+            }
+            catch { }
+            return "";
+        }
+
+        // Runtime settings for a WebView2 that is already created.
+        private static void ApplyLightSettings(CoreWebView2 core)
+        {
+            try
+            {
+                core.Settings.IsPasswordAutosaveEnabled = false;
+                core.Settings.IsGeneralAutofillEnabled = false;
+            }
+            catch { }
+
+            // Ask the engine to use less memory (needs a newer WebView2 SDK/runtime).
+            // Done with reflection so older SDK versions still compile and just skip it.
+            try
+            {
+                var prop = typeof(CoreWebView2).GetProperty("MemoryUsageTargetLevel");
+                if (prop != null && prop.CanWrite)
+                    prop.SetValue(core, Enum.ToObject(prop.PropertyType, 1), null);   // 1 = Low
+            }
+            catch { }
+        }
+
+        // Writes why WebView2 failed to %LocalAppData%\BNetBrowser\fallback.log
+        private static void LogFallback(Exception ex)
+        {
+            try
+            {
+                Directory.CreateDirectory(FallbackProfileRoot);
+                File.AppendAllText(Path.Combine(FallbackProfileRoot, "fallback.log"),
+                    DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "  WebView2 failed: " + ex + "\r\n\r\n");
+            }
+            catch { }
         }
 
         // ================= Browser fallback =================
@@ -292,19 +357,6 @@ namespace BNetBrowser
             new Candidate("Firefox", "firefox.exe", @"Mozilla Firefox\firefox.exe", true),
             new Candidate("Vivaldi", "vivaldi.exe", @"Vivaldi\Application\vivaldi.exe", false)
         };
-
-        private static bool IsWebView2Available()
-        {
-            try
-            {
-                string version = CoreWebView2Environment.GetAvailableBrowserVersionString(FixedRuntimeFolder);
-                return !string.IsNullOrEmpty(version);
-            }
-            catch
-            {
-                return false;
-            }
-        }
 
         private static ExternalBrowser Locate(Candidate c)
         {
@@ -404,7 +456,7 @@ namespace BNetBrowser
                 string url = NormalizeUrl(homeUrl).Replace("\"", "%22");
                 string args = browser.IsFirefox
                     ? "-new-window \"" + url + "\""
-                    : "--new-window \"" + url + "\"";
+                    : "--new-window " + LightArgsCommon + ExtraArgs() + " \"" + url + "\"";
 
                 Process.Start(new ProcessStartInfo(browser.Exe, args) { UseShellExecute = false });
             }
@@ -438,7 +490,23 @@ namespace BNetBrowser
                         "user_pref(\"browser.startup.homepage_override.mstone\", \"ignore\");\r\n" +
                         "user_pref(\"browser.shell.checkDefaultBrowser\", false);\r\n" +
                         "user_pref(\"datareporting.policy.dataSubmissionPolicyBypassNotification\", true);\r\n" +
-                        "user_pref(\"browser.sessionstore.resume_from_crash\", false);\r\n");
+                        "user_pref(\"browser.sessionstore.resume_from_crash\", false);\r\n" +
+                        // low resource mode
+                        "user_pref(\"dom.ipc.processCount\", 1);\r\n" +
+                        "user_pref(\"browser.sessionhistory.max_total_viewers\", 0);\r\n" +
+                        "user_pref(\"browser.cache.disk.enable\", false);\r\n" +
+                        "user_pref(\"browser.cache.memory.capacity\", 32768);\r\n" +
+                        "user_pref(\"browser.tabs.unloadOnLowMemory\", true);\r\n" +
+                        "user_pref(\"browser.safebrowsing.malware.enabled\", false);\r\n" +
+                        "user_pref(\"browser.safebrowsing.phishing.enabled\", false);\r\n" +
+                        "user_pref(\"network.prefetch-next\", false);\r\n" +
+                        "user_pref(\"network.dns.disablePrefetch\", true);\r\n" +
+                        "user_pref(\"extensions.pocket.enabled\", false);\r\n" +
+                        "user_pref(\"app.update.auto\", false);\r\n" +
+                        "user_pref(\"app.update.enabled\", false);\r\n" +
+                        "user_pref(\"toolkit.telemetry.enabled\", false);\r\n" +
+                        "user_pref(\"datareporting.healthreport.uploadEnabled\", false);\r\n" +
+                        "user_pref(\"browser.newtabpage.activity-stream.feeds.telemetry\", false);\r\n");
                 }
                 catch { }
 
@@ -448,6 +516,7 @@ namespace BNetBrowser
             return "--kiosk --no-first-run --no-default-browser-check " +
                    "--disable-pinch --overscroll-history-navigation=0 " +
                    "--disable-infobars --noerrdialogs --disable-session-crashed-bubble " +
+                   "--disable-extensions " + LightArgsCommon + ExtraArgs() + " " +
                    "--user-data-dir=\"" + profile + "\" \"" + url + "\"";
         }
 
@@ -504,7 +573,22 @@ namespace BNetBrowser
                 });
 
                 Hide();   // let the browser own the screen
+
+                DateTime started = DateTime.UtcNow;
                 if (p != null) await Task.Run(() => p.WaitForExit());
+
+                // Some browsers (Firefox, Edge) start through a small launcher process that
+                // exits right away while the real browser keeps running. If that happened,
+                // keep waiting until no process of that browser is left, otherwise the .bat
+                // would relaunch the kiosk again and again.
+                if ((DateTime.UtcNow - started).TotalSeconds < 15)
+                {
+                    string procName = Path.GetFileNameWithoutExtension(browser.Exe);
+                    await Task.Delay(3000);
+                    while (!IsDisposed && Process.GetProcessesByName(procName).Length > 0)
+                        await Task.Delay(2000);
+                }
+
                 if (!IsDisposed) Close();
             }
             catch (Exception ex)
@@ -599,6 +683,7 @@ namespace BNetBrowser
             if (wb.IsDisposed) return;   // tab was closed while starting
 
             var core = wb.CoreWebView2;
+            ApplyLightSettings(core);
             core.Settings.AreDevToolsEnabled = true;
             core.DocumentTitleChanged += (s, e) => UpdateTitle(wb);
             core.StatusBarTextChanged += (s, e) =>
@@ -757,6 +842,7 @@ namespace BNetBrowser
             if (!await InitWebView(kioskBrowser)) return;
 
             var core = kioskBrowser.CoreWebView2;
+            ApplyLightSettings(core);
             core.Settings.AreDefaultContextMenusEnabled = false;
             core.Settings.AreDevToolsEnabled = false;
             core.Settings.IsStatusBarEnabled = false;
@@ -920,6 +1006,89 @@ namespace BNetBrowser
         [DllImport("kernel32.dll")]
         private static extern bool SetProcessWorkingSetSize(IntPtr proc, int min, int max);
 
+        // ---- trim the browser child processes (msedgewebview2, chrome, brave, firefox ...) ----
+
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        private struct PROCESSENTRY32
+        {
+            public uint dwSize;
+            public uint cntUsage;
+            public uint th32ProcessID;
+            public IntPtr th32DefaultHeapID;
+            public uint th32ModuleID;
+            public uint cntThreads;
+            public uint th32ParentProcessID;
+            public int pcPriClassBase;
+            public uint dwFlags;
+            [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 260)]
+            public string szExeFile;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr CreateToolhelp32Snapshot(uint flags, uint pid);
+
+        [DllImport("kernel32.dll", EntryPoint = "Process32FirstW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32First(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
+        [DllImport("kernel32.dll", EntryPoint = "Process32NextW", CharSet = CharSet.Unicode, SetLastError = true)]
+        private static extern bool Process32Next(IntPtr snapshot, ref PROCESSENTRY32 entry);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint access, bool inherit, uint pid);
+
+        [DllImport("kernel32.dll")]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        [DllImport("psapi.dll", SetLastError = true)]
+        private static extern bool EmptyWorkingSet(IntPtr process);
+
+        // Empties the working set of every process that was started by this app
+        // (all descendants). RAM comes back only for what the page really uses.
+        private static void TrimChildProcesses()
+        {
+            IntPtr snap = CreateToolhelp32Snapshot(0x00000002, 0);   // TH32CS_SNAPPROCESS
+            if (snap == IntPtr.Zero || snap == new IntPtr(-1)) return;
+
+            var parentOf = new Dictionary<uint, uint>();
+            try
+            {
+                var e = new PROCESSENTRY32();
+                e.dwSize = (uint)Marshal.SizeOf(typeof(PROCESSENTRY32));
+                if (Process32First(snap, ref e))
+                {
+                    do { parentOf[e.th32ProcessID] = e.th32ParentProcessID; }
+                    while (Process32Next(snap, ref e));
+                }
+            }
+            finally { CloseHandle(snap); }
+
+            uint me = (uint)Process.GetCurrentProcess().Id;
+            var family = new HashSet<uint> { me };
+            bool added = true;
+            while (added)
+            {
+                added = false;
+                foreach (KeyValuePair<uint, uint> kv in parentOf)
+                {
+                    if (!family.Contains(kv.Key) && family.Contains(kv.Value))
+                    {
+                        family.Add(kv.Key);
+                        added = true;
+                    }
+                }
+            }
+            family.Remove(me);
+
+            foreach (uint pid in family)
+            {
+                // PROCESS_QUERY_INFORMATION | PROCESS_SET_QUOTA
+                IntPtr h = OpenProcess(0x0400 | 0x0100, false, pid);
+                if (h == IntPtr.Zero) continue;
+                try { EmptyWorkingSet(h); }
+                finally { CloseHandle(h); }
+            }
+        }
+
         private static void TrimMemory()
         {
             try
@@ -927,6 +1096,7 @@ namespace BNetBrowser
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
                 SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle, -1, -1);
+                TrimChildProcesses();   // WebView2 / Chrome / Brave / Firefox processes we started
             }
             catch { }
         }
