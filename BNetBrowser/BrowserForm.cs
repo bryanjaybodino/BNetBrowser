@@ -7,6 +7,7 @@ using System.Net.Cache;
 using System.Runtime.InteropServices;
 using System.Threading.Tasks;
 using System.Windows.Forms;
+using Microsoft.Win32;
 using Microsoft.Web.WebView2.Core;
 using Microsoft.Web.WebView2.WinForms;
 
@@ -168,6 +169,24 @@ namespace BNetBrowser
             Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
             "BNetBrowser", "WebView2");
 
+        // Chrome fallback profile (used only in kiosk fallback, keeps it separate from the user's own Chrome)
+        private static readonly string ChromeKioskProfile = Path.Combine(
+            Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData),
+            "BNetBrowser", "ChromeKiosk");
+
+        // optional bundled WebView2 runtime next to the exe
+        private static string FixedRuntimeFolder
+        {
+            get
+            {
+                string f = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "WebView2Runtime");
+                return Directory.Exists(f) ? f : null;
+            }
+        }
+
+        // true once we handed over to Google Chrome (no WebView2 / Edge runtime)
+        private bool chromeFallbackActive = false;
+
         public BrowserForm() : this("http://localhost/", false)
         {
         }
@@ -188,6 +207,10 @@ namespace BNetBrowser
         private void BrowserForm_Load(object sender, EventArgs e)
         {
             trimTimer.Start();
+
+            // No WebView2 (Edge) runtime -> try Google Chrome instead
+            if (!IsWebView2Available() && UseChromeFallback())
+                return;
 
             if (kioskMode)
             {
@@ -213,7 +236,7 @@ namespace BNetBrowser
                 wb.CreationProperties = new CoreWebView2CreationProperties
                 {
                     UserDataFolder = DataFolder,
-                    // disable swipe back/forward and pinch zoom (touch screens)
+                    BrowserExecutableFolder = FixedRuntimeFolder,
                     AdditionalBrowserArguments = "--overscroll-history-navigation=0 --disable-pinch"
                 };
 
@@ -222,12 +245,174 @@ namespace BNetBrowser
             }
             catch (Exception ex)
             {
+                // WebView2 failed -> Chrome is the alternative
+                if (UseChromeFallback()) return false;
+
                 MessageBox.Show(
-                    "Could not start the WebView2 (Edge) runtime.\n\n" +
-                    "Install the 'Evergreen WebView2 Runtime' from Microsoft:\n" +
-                    "https://go.microsoft.com/fwlink/p/?LinkId=2124703\n\n" + ex.Message,
+                    "Could not start the WebView2 (Edge) runtime, and Google Chrome was not found.\n\n" +
+                    "Install one of these:\n" +
+                    "- Evergreen WebView2 Runtime: https://go.microsoft.com/fwlink/p/?LinkId=2124703\n" +
+                    "- Google Chrome: https://www.google.com/chrome/\n\n" + ex.Message,
                     AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
                 return false;
+            }
+        }
+
+        // ================= Chrome fallback =================
+
+        private static bool IsWebView2Available()
+        {
+            try
+            {
+                string version = CoreWebView2Environment.GetAvailableBrowserVersionString(FixedRuntimeFolder);
+                return !string.IsNullOrEmpty(version);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        // Finds chrome.exe: registry (App Paths) first, then the usual install folders.
+        private static string FindChrome()
+        {
+            try
+            {
+                string[] keys =
+                {
+                    @"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe",
+                    @"SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\chrome.exe"
+                };
+                RegistryKey[] roots = { Registry.LocalMachine, Registry.CurrentUser };
+
+                foreach (RegistryKey root in roots)
+                    foreach (string k in keys)
+                        using (RegistryKey key = root.OpenSubKey(k))
+                        {
+                            string p = key == null ? null : key.GetValue(null) as string;
+                            if (!string.IsNullOrEmpty(p) && File.Exists(p)) return p;
+                        }
+            }
+            catch { }
+
+            string[] bases =
+            {
+                Environment.GetEnvironmentVariable("ProgramFiles"),
+                Environment.GetEnvironmentVariable("ProgramFiles(x86)"),
+                Environment.GetEnvironmentVariable("LocalAppData")
+            };
+
+            foreach (string b in bases)
+            {
+                if (string.IsNullOrEmpty(b)) continue;
+                string p = Path.Combine(b, "Google", "Chrome", "Application", "chrome.exe");
+                if (File.Exists(p)) return p;
+            }
+            return null;
+        }
+
+        // Hands over to Google Chrome. Returns false if Chrome isn't installed / can't start.
+        private bool UseChromeFallback()
+        {
+            if (chromeFallbackActive) return true;
+
+            string exe = FindChrome();
+            if (exe == null) return false;
+
+            chromeFallbackActive = true;
+
+            if (kioskMode)
+            {
+                StartChromeKiosk(exe);
+                return true;
+            }
+
+            try
+            {
+                string url = NormalizeUrl(homeUrl).Replace("\"", "%22");
+                Process.Start(new ProcessStartInfo(exe, "--new-window \"" + url + "\"")
+                {
+                    UseShellExecute = false
+                });
+            }
+            catch
+            {
+                chromeFallbackActive = false;
+                return false;
+            }
+
+            // Chrome is open - this window has nothing left to do
+            Opacity = 0;
+            ShowInTaskbar = false;
+            BeginInvoke((Action)Close);
+            return true;
+        }
+
+        // Kiosk via Chrome: show the waiting screen until the server answers,
+        // start Chrome in --kiosk, and exit when Chrome is closed.
+        private async void StartChromeKiosk(string chromeExe)
+        {
+            try
+            {
+                toolbar.Visible = false;
+                status.Visible = false;
+                tabs.Visible = false;
+
+                if (kioskBrowser != null)
+                {
+                    Controls.Remove(kioskBrowser);
+                    kioskBrowser.Dispose();
+                    kioskBrowser = null;
+                }
+
+                BackColor = Color.FromArgb(17, 17, 17);
+                FormBorderStyle = FormBorderStyle.None;
+                WindowState = FormWindowState.Maximized;
+
+                var lbl = new Label
+                {
+                    Dock = DockStyle.Fill,
+                    ForeColor = Color.White,
+                    BackColor = Color.FromArgb(17, 17, 17),
+                    Font = new Font("Segoe UI Light", 28f),
+                    TextAlign = ContentAlignment.MiddleCenter,
+                    Text = "Starting up, please wait...",
+                    Cursor = Cursors.WaitCursor
+                };
+                Controls.Add(lbl);
+                lbl.BringToFront();
+
+                string url = NormalizeUrl(homeUrl).Replace("\"", "%22");
+
+                while (!IsDisposed)
+                {
+                    bool up = await Task.Run(() => ServerAnswers(homeUrl));
+                    if (up) break;
+                    await Task.Delay(2000);
+                }
+                if (IsDisposed) return;
+
+                await Task.Delay(5000);   // settle time after the server first answers
+                if (IsDisposed) return;
+
+                Directory.CreateDirectory(ChromeKioskProfile);
+                string args = "--kiosk --no-first-run --no-default-browser-check " +
+                              "--disable-pinch --overscroll-history-navigation=0 " +
+                              "--disable-infobars --noerrdialogs --disable-session-crashed-bubble " +
+                              "--user-data-dir=\"" + ChromeKioskProfile + "\" \"" + url + "\"";
+
+                Process p = Process.Start(new ProcessStartInfo(chromeExe, args) { UseShellExecute = false });
+
+                Hide();   // let Chrome own the screen
+                if (p != null) await Task.Run(() => p.WaitForExit());
+                if (!IsDisposed) Close();
+            }
+            catch (Exception ex)
+            {
+                if (IsDisposed) return;
+                MessageBox.Show("Could not start Google Chrome.\n\n" + ex.Message,
+                    AppName, MessageBoxButtons.OK, MessageBoxIcon.Error);
+                Close();
             }
         }
 
