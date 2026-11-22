@@ -12,12 +12,21 @@ namespace BNetBrowser
             Application.EnableVisualStyles();
             Application.SetCompatibleTextRenderingDefault(false);
 
-            // Usage: BNetBrowser.exe [--kiosk] [url]
+            // Usage: BNetBrowser.exe [--kiosk] [--no-webview2] [--browser=name] [--lowmem] [url]
             bool kiosk = false;
             string argUrl = null;
             foreach (string a in args)
             {
                 if (a.Equals("--kiosk", StringComparison.OrdinalIgnoreCase)) kiosk = true;
+                else if (a.Equals("--lowmem", StringComparison.OrdinalIgnoreCase))
+                    BrowserForm.LowMemory = true;
+                else if (a.Equals("--no-webview2", StringComparison.OrdinalIgnoreCase))
+                    BrowserForm.ForceFallback = true;
+                else if (a.StartsWith("--browser=", StringComparison.OrdinalIgnoreCase))
+                {
+                    BrowserForm.PreferredBrowser = a.Substring("--browser=".Length).Trim();
+                    BrowserForm.ForceFallback = true;
+                }
                 else if (argUrl == null && !string.IsNullOrWhiteSpace(a)) argUrl = a.Trim();
             }
 

@@ -185,6 +185,12 @@ namespace BNetBrowser
             }
         }
 
+        // Set from the command line (see Program.cs):
+        //   --no-webview2        skip WebView2 and use another installed browser (for testing)
+        //   --browser=chrome     same, and choose which one (chrome, brave, edge, firefox, vivaldi)
+        public static bool ForceFallback = false;
+        public static string PreferredBrowser = null;
+
         // true once we handed over to another browser (no WebView2 / Edge runtime)
         private bool browserFallbackActive = false;
 
@@ -228,6 +234,9 @@ namespace BNetBrowser
         // All WebView2 controls in this process share the same profile + arguments.
         private async Task<bool> InitWebView(WebView2 wb)
         {
+            // test switch: skip WebView2 completely
+            if (ForceFallback && UseBrowserFallback()) return false;
+
             try
             {
                 wb.CreationProperties = new CoreWebView2CreationProperties
@@ -265,14 +274,31 @@ namespace BNetBrowser
         // Optional: put extra command-line flags on the first line of extra-args.txt
         // next to the exe (for example --disable-gpu or --js-flags=--max-old-space-size=256).
 
-        private const string LightArgsCommon =
-            "--renderer-process-limit=1 --in-process-gpu --enable-low-end-device-mode " +
-            "--disable-background-networking --disable-sync --disable-default-apps " +
-            "--disable-component-update --disable-breakpad --disable-domain-reliability " +
-            "--disable-client-side-phishing-detection --metrics-recording-only --no-pings " +
-            "--disable-features=Translate,MediaRouter,OptimizationHints,AutofillServerCommunication," +
-            "InterestFeedContentSuggestions,msSmartScreenProtection," +
-            "IsolateOrigins,site-per-process,NetworkServiceInProcess,NetworkServiceInProcess2";
+        // Set from the command line: --lowmem  (smaller RAM, but animations can be slower)
+        public static bool LowMemory = false;
+
+        // Safe options: remove background work only, no effect on rendering speed.
+        private static string LightArgsCommon
+        {
+            get
+            {
+                string features = "Translate,MediaRouter,OptimizationHints,AutofillServerCommunication," +
+                                  "InterestFeedContentSuggestions,msSmartScreenProtection";
+                string args = "--disable-background-networking --disable-sync --disable-default-apps " +
+                              "--disable-component-update --disable-breakpad --disable-domain-reliability " +
+                              "--disable-client-side-phishing-detection --metrics-recording-only --no-pings";
+
+                if (LowMemory)
+                {
+                    // fewer processes / less RAM, at the cost of smoothness
+                    args = "--renderer-process-limit=1 --in-process-gpu --enable-low-end-device-mode " + args;
+                    features += ",IsolateOrigins,site-per-process,NetworkServiceInProcess,NetworkServiceInProcess2";
+                }
+
+                // one single --disable-features list (a second one would override the first)
+                return args + " --disable-features=" + features;
+            }
+        }
 
         private static string ExtraArgs()
         {
@@ -302,13 +328,15 @@ namespace BNetBrowser
 
             // Ask the engine to use less memory (needs a newer WebView2 SDK/runtime).
             // Done with reflection so older SDK versions still compile and just skip it.
-            try
-            {
-                var prop = typeof(CoreWebView2).GetProperty("MemoryUsageTargetLevel");
-                if (prop != null && prop.CanWrite)
-                    prop.SetValue(core, Enum.ToObject(prop.PropertyType, 1), null);   // 1 = Low
-            }
-            catch { }
+            // Only in --lowmem mode: it makes the page slower.
+            if (LowMemory)
+                try
+                {
+                    var prop = typeof(CoreWebView2).GetProperty("MemoryUsageTargetLevel");
+                    if (prop != null && prop.CanWrite)
+                        prop.SetValue(core, Enum.ToObject(prop.PropertyType, 1), null);   // 1 = Low
+                }
+                catch { }
         }
 
         // Writes why WebView2 failed to %LocalAppData%\BNetBrowser\fallback.log
@@ -405,17 +433,18 @@ namespace BNetBrowser
 
         private static ExternalBrowser FindBrowser()
         {
-            string preferred = null;
-            try
-            {
-                string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "browser.txt");
-                if (File.Exists(cfg))
+            string preferred = PreferredBrowser;   // --browser=name wins over browser.txt
+            if (string.IsNullOrEmpty(preferred))
+                try
                 {
-                    string[] lines = File.ReadAllLines(cfg);
-                    if (lines.Length > 0) preferred = lines[0].Trim();
+                    string cfg = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "browser.txt");
+                    if (File.Exists(cfg))
+                    {
+                        string[] lines = File.ReadAllLines(cfg);
+                        if (lines.Length > 0) preferred = lines[0].Trim();
+                    }
                 }
-            }
-            catch { }
+                catch { }
 
             if (!string.IsNullOrEmpty(preferred))
             {
@@ -1096,7 +1125,7 @@ namespace BNetBrowser
                 GC.Collect();
                 GC.WaitForPendingFinalizers();
                 SetProcessWorkingSetSize(Process.GetCurrentProcess().Handle, -1, -1);
-                TrimChildProcesses();   // WebView2 / Chrome / Brave / Firefox processes we started
+                if (LowMemory) TrimChildProcesses();   // WebView2 / Chrome / Brave / Firefox processes we started
             }
             catch { }
         }
